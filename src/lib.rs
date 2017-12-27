@@ -1,3 +1,22 @@
+//! A simple RSA library.
+//!
+//! This library performs all the standard bits and pieces that you'd expect
+//! from an RSA library, and does so using only Rust. It's a bit slow at the
+//! moment, but it gets the job done.
+//!
+//! Key generation is supported, using either the native `OsRng` or a random
+//! number generator of your choice. Obviously, you should be careful to use
+//! a cryptographically-sound random number generator sufficient for the
+//! security level you're going for.
+//!
+//! Signing and verification are via standard PKCS1 padding, but can be
+//! adjusted based on the exact hash you want. This library also supports
+//! somewhat arbitrary signing mechanisms used by your weirder network
+//! protocols. (I'm looking at you, Tor.)
+//!
+//! Encryption and decryption are via the OAEP mechanism, as described in
+//! NIST documents.
+//!
 extern crate digest;
 #[macro_use]
 extern crate lazy_static;
@@ -26,6 +45,8 @@ pub use signing_hashes::{SigningHash,
                          SIGNING_HASH_SHA384,
                          SIGNING_HASH_SHA512};
 
+
+/// An RSA public and private key.
 #[derive(Clone,Debug)]
 pub struct RSAKeyPair {
     pub private: RSAPrivateKey,
@@ -44,11 +65,29 @@ impl From<io::Error> for RSAKeyGenError {
 }
 
 impl RSAKeyPair {
+    /// Generates a fresh RSA key pair of the given bit size. Valid bit sizes
+    /// are 512, 1024, 2048, 3072, 4096, 7680, 8192, and 15360. If you
+    /// actually want to protect data, use a value greater than or equal to
+    /// 2048. If you don't want to spend all day waiting for RSA computations
+    /// to finish, choose a value less than or equal to 4096.
+    ///
+    /// This routine will use `OsRng` for entropy. If you want to use your
+    /// own random number generator, use `generate_w_rng`.
     pub fn generate(len_bits: usize) -> Result<RSAKeyPair,RSAKeyGenError> {
         let mut rng = OsRng::new()?;
         RSAKeyPair::generate_w_rng(&mut rng, len_bits)
     }
 
+    /// Generates a fresh RSA key pair of the given bit size. Valid bit sizes
+    /// are 512, 1024, 2048, 3072, 4096, 7680, 8192, and 15360. If you
+    /// actually want to protect data, use a value greater than or equal to
+    /// 2048. If you don't want to spend all day waiting for RSA computations
+    /// to finish, choose a value less than or equal to 4096.
+    ///
+    /// If you provide your own random number generator that is not `OsRng`,
+    /// you should know what you're doing, and be using a cryptographically-
+    /// strong RNG of your own choosing. We've warned you. Use a good one.
+    /// So now it's on you.
     pub fn generate_w_rng<G: Rng>(rng: &mut G, len_bits: usize)
         -> Result<RSAKeyPair,RSAKeyGenError>
     {
@@ -72,6 +111,8 @@ impl RSAKeyPair {
     }
 }
 
+
+/// A RSA public key.
 #[derive(Clone,Debug)]
 pub struct RSAPublicKey {
     key_length: usize,
@@ -95,6 +136,8 @@ impl From<io::Error> for RSAError {
 }
 
 impl RSAPublicKey {
+    /// Create a new `RSAPublicKey` from the given components, which you
+    /// found via some other mechanism.
     pub fn new(len: usize, n: BigUint, e: BigUint) -> RSAPublicKey {
         RSAPublicKey {
             key_length: len,
@@ -103,6 +146,8 @@ impl RSAPublicKey {
         }
     }
 
+    /// Verify the signature for a given message, using the given signing hash,
+    /// returning true iff the signature validates.
     pub fn verify(&self, sighash: &SigningHash, msg: &[u8], sig: Vec<u8>) -> bool {
         let hash = (sighash.run)(msg);
         let s    = o2isp(&sig);
@@ -112,6 +157,12 @@ impl RSAPublicKey {
         (em == em_)
     }
 
+    /// Encrypt the given data with the public key and parameters, returning
+    /// the encrypted blob or an error encountered during encryption.
+    ///
+    /// OAEP encoding is used for this process, which requires a random number
+    /// generator. This version of the function uses `OsRng`. If you want to
+    /// use your own RNG, use `encrypt_w_rng`.
     pub fn encrypt<H:Clone + Input + FixedOutput>(&self, oaep: &OAEPParams<H>, msg: &[u8])
         -> Result<Vec<u8>,RSAError>
     {
@@ -119,6 +170,10 @@ impl RSAPublicKey {
         self.encrypt_with_rng(&mut g, oaep, msg)
     }
 
+    /// Encrypt the given data with the public key and parameters, returning
+    /// the encrypted blob or an error encountered during encryption. This
+    /// version also allows you to provide your own RNG, if you really feel
+    /// like shooting yourself in the foot.
     pub fn encrypt_with_rng<G,H>(&self, g: &mut G, oaep: &OAEPParams<H>, msg: &[u8])
         -> Result<Vec<u8>,RSAError>
       where G: Rng, H: Clone + Input + FixedOutput
@@ -186,6 +241,7 @@ fn xor_vecs(a: &Vec<u8>, b: &Vec<u8>) -> Vec<u8> {
 }
 
 
+/// A RSA private key.
 #[derive(Clone,Debug)]
 pub struct RSAPrivateKey {
     key_length: usize,
@@ -194,6 +250,8 @@ pub struct RSAPrivateKey {
 }
 
 impl RSAPrivateKey {
+    /// Generate a private key, using the given `n` and `d` parameters
+    /// gathered from some other source.
     pub fn new(len: usize, n: BigUint, d: BigUint) -> RSAPrivateKey {
         RSAPrivateKey {
             key_length: len,
@@ -202,6 +260,7 @@ impl RSAPrivateKey {
         }
     }
 
+    /// Sign a message using the given hash.
     pub fn sign(&self, sighash: &SigningHash, msg: &[u8]) -> Vec<u8> {
         let hash = (sighash.run)(msg);
         let em   = pkcs1_pad(&sighash.ident, &hash, self.key_length);
@@ -211,6 +270,7 @@ impl RSAPrivateKey {
         sig
     }
 
+    /// Decrypt a message with the given parameters.
     pub fn decrypt<H: Clone + Input + FixedOutput>(&self, oaep: &OAEPParams<H>, msg: &[u8])
         -> Result<Vec<u8>,RSAError>
     {
@@ -319,6 +379,9 @@ fn vp1(n: &BigUint, e: &BigUint, s: &BigUint) -> BigUint {
     s.modpow(e, n)
 }
 
+/// Parameters for OAEP encryption and decryption: a hash function to use
+/// as part of the message generation function (MGF1, if you're curious),
+/// and any labels you want to include as part of the encryption.
 pub struct OAEPParams<H: Clone + Input + FixedOutput> {
     pub hash: H,
     pub label: String

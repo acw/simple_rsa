@@ -1,7 +1,12 @@
 [package]
 name = "simple_rsa"
 version = "0.1.0"
-authors = ["awick@uhsure.com"]
+authors = ["Adam Wick <awick@uhsure.com>"]
+description = "A simple RSA signing, verification, encryption, and decryption library in pure Rust."
+categories = ["cryptography"]
+keywords = ["crypto","cryptography","RSA"]
+license-file = "LICENSE"
+repository = "https://github.com/acw/simple_rsa"
 
 [dependencies]
 digest      = "^0.7.1"
