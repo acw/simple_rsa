@@ -27,14 +27,17 @@ extern crate quickcheck;
 extern crate rand;
 extern crate sha1;
 extern crate sha2;
+extern crate simple_asn1;
 
 mod numutils;
 mod signing_hashes;
 
 use digest::{FixedOutput,Input};
-use num::{BigUint,FromPrimitive,One,Zero};
+use num::{BigUint,BigInt,FromPrimitive,One,Zero};
 use numutils::{i2osp,o2isp,modinv,generate_pq};
 use rand::{OsRng,Rng};
+use simple_asn1::{ASN1Block,ASN1DecodeErr,ASN1EncodeErr,
+                  ASN1Class,FromASN1,ToASN1};
 use std::io;
 
 pub use signing_hashes::{SigningHash,
@@ -103,8 +106,8 @@ impl RSAKeyPair {
                 let phi = (p - &one) * (q - &one);
                 let e = BigUint::from_u32(65537).unwrap();
                 let d = modinv(&e, &phi);
-                let public_key  = RSAPublicKey{ key_length: len_bytes, n: n.clone(), e: e};
-                let private_key = RSAPrivateKey{key_length: len_bytes, n: n,         d: d};
+                let public_key  = RSAPublicKey{ byte_len: len_bytes, n: n.clone(), e: e};
+                let private_key = RSAPrivateKey{byte_len: len_bytes, n: n,         d: d};
                 return Ok(RSAKeyPair{ private: private_key, public: public_key })
             }
         }
@@ -115,7 +118,7 @@ impl RSAKeyPair {
 /// A RSA public key.
 #[derive(Clone,Debug)]
 pub struct RSAPublicKey {
-    key_length: usize,
+    byte_len: usize,
     n: BigUint,
     e: BigUint
 }
@@ -126,7 +129,9 @@ pub enum RSAError {
     KeyTooSmallForHash,
     DecryptionError,
     DecryptHashMismatch,
-    RandomGenError(io::Error)
+    InvalidKey,
+    RandomGenError(io::Error),
+    ASN1DecodeErr(ASN1DecodeErr)
 }
 
 impl From<io::Error> for RSAError {
@@ -135,12 +140,64 @@ impl From<io::Error> for RSAError {
     }
 }
 
+impl From<ASN1DecodeErr> for RSAError {
+    fn from(e: ASN1DecodeErr) -> RSAError {
+        RSAError::ASN1DecodeErr(e)
+    }
+}
+
+impl FromASN1 for RSAPublicKey {
+    type Error = RSAError;
+
+    fn from_asn1(bs: &[ASN1Block])
+        -> Result<(RSAPublicKey,&[ASN1Block]),RSAError>
+    {
+        match bs.split_first() {
+            None =>
+                Err(RSAError::ASN1DecodeErr(ASN1DecodeErr::EmptyBuffer)),
+            Some((&ASN1Block::Sequence(_, _, ref items), rest))
+                if items.len() == 2 =>
+            {
+                let n = decode_biguint(&items[0])?;
+                let e = decode_biguint(&items[1])?;
+                let nsize = n.bits();
+                let mut rsa_size = 512;
+
+                while rsa_size < nsize {
+                    rsa_size = rsa_size + 256;
+                }
+                rsa_size /= 8;
+
+                let res = RSAPublicKey{ byte_len: rsa_size, n: n, e: e };
+
+                Ok((res, rest))
+            }
+            Some(_) =>
+                Err(RSAError::InvalidKey)
+        }
+    }
+}
+
+impl ToASN1 for RSAPublicKey {
+    type Error = ASN1EncodeErr;
+
+    fn to_asn1_class(&self, c: ASN1Class)
+        -> Result<Vec<ASN1Block>,Self::Error>
+    {
+        let enc_n = ASN1Block::Integer(c, 0, BigInt::from(self.n.clone()));
+        let enc_e = ASN1Block::Integer(c, 0, BigInt::from(self.e.clone()));
+        let seq = ASN1Block::Sequence(c, 0, vec![enc_n, enc_e]);
+        Ok(vec![seq])
+    }
+}
+
 impl RSAPublicKey {
     /// Create a new `RSAPublicKey` from the given components, which you
-    /// found via some other mechanism.
+    /// found via some other mechanism. The length should be given in
+    /// bits.
     pub fn new(len: usize, n: BigUint, e: BigUint) -> RSAPublicKey {
         RSAPublicKey {
-            key_length: len,
+            byte_len: len / 8,
             n: n,
             e: e
         }
@@ -152,8 +209,8 @@ impl RSAPublicKey {
         let hash = (sighash.run)(msg);
         let s    = o2isp(&sig);
         let m    = vp1(&self.n, &self.e, &s);
-        let em   = i2osp(&m, self.key_length);
-        let em_  = pkcs1_pad(&sighash.ident, &hash, self.key_length);
+        let em   = i2osp(&m, self.byte_len);
+        let em_  = pkcs1_pad(&sighash.ident, &hash, self.byte_len);
         (em == em_)
     }
 
@@ -178,13 +235,13 @@ impl RSAPublicKey {
         -> Result<Vec<u8>,RSAError>
       where G: Rng, H: Clone + Input + FixedOutput
     {
-        if self.key_length <= ((2 * oaep.hash_len()) + 2) {
+        if self.byte_len <= ((2 * oaep.hash_len()) + 2) {
             return Err(RSAError::KeyTooSmallForHash);
         }
 
         let mut res = Vec::new();
 
-        for chunk in msg.chunks(self.key_length - (2 * oaep.hash_len()) - 2) {
+        for chunk in msg.chunks(self.byte_len - (2 * oaep.hash_len()) - 2) {
             let mut newchunk = self.oaep_encrypt(g, oaep, chunk)?;
             res.append(&mut newchunk)
         }
@@ -196,13 +253,13 @@ impl RSAPublicKey {
         -> Result<Vec<u8>,RSAError>
     {
         // Step 1b
-        if msg.len() > (self.key_length - (2 * oaep.hash_len()) - 2) {
+        if msg.len() > (self.byte_len - (2 * oaep.hash_len()) - 2) {
             return Err(RSAError::BadMessageSize)
         }
         // Step 2a
         let mut lhash = oaep.hash(oaep.label.as_bytes());
         // Step 2b
-        let num0s = self.key_length - msg.len() - (2 * oaep.hash_len()) - 2;
+        let num0s = self.byte_len - msg.len() - (2 * oaep.hash_len()) - 2;
         let mut ps = Vec::new();
         ps.resize(num0s, 0);
         // Step 2c
@@ -214,7 +271,7 @@ impl RSAPublicKey {
         // Step 2d
         let seed : Vec<u8> = g.gen_iter().take(oaep.hash_len()).collect();
         // Step 2e
-        let db_mask = oaep.mgf1(&seed, self.key_length - oaep.hash_len() - 1);
+        let db_mask = oaep.mgf1(&seed, self.byte_len - oaep.hash_len() - 1);
         // Step 2f
         let mut masked_db = xor_vecs(&db, &db_mask);
         // Step 2g
@@ -231,7 +288,7 @@ impl RSAPublicKey {
         // Step 3b
         let c_i = ep(&self.n, &self.e, &m_i);
         // Step 3c
-        let c = i2osp(&c_i, self.key_length);
+        let c = i2osp(&c_i, self.byte_len);
         Ok(c)
     }
 }
@@ -244,17 +301,18 @@ fn xor_vecs(a: &Vec<u8>, b: &Vec<u8>) -> Vec<u8> {
 /// A RSA private key.
 #[derive(Clone,Debug)]
 pub struct RSAPrivateKey {
-    key_length: usize,
+    byte_len: usize,
     n: BigUint,
     d: BigUint
 }
 
 impl RSAPrivateKey {
     /// Generate a private key, using the given `n` and `d` parameters
-    /// gathered from some other source.
+    /// gathered from some other source. The length should be given in
+    /// bits.
     pub fn new(len: usize, n: BigUint, d: BigUint) -> RSAPrivateKey {
         RSAPrivateKey {
-            key_length: len,
+            byte_len: len / 8,
             n: n,
             d: d
         }
@@ -263,10 +321,10 @@ impl RSAPrivateKey {
     /// Sign a message using the given hash.
     pub fn sign(&self, sighash: &SigningHash, msg: &[u8]) -> Vec<u8> {
         let hash = (sighash.run)(msg);
-        let em   = pkcs1_pad(&sighash.ident, &hash, self.key_length);
+        let em   = pkcs1_pad(&sighash.ident, &hash, self.byte_len);
         let m    = o2isp(&em);
         let s    = sp1(&self.n, &self.d, &m);
-        let sig  = i2osp(&s, self.key_length);
+        let sig  = i2osp(&s, self.byte_len);
         sig
     }
 
@@ -276,7 +334,7 @@ impl RSAPrivateKey {
     {
         let mut res = Vec::new();
 
-        for chunk in msg.chunks(self.key_length) {
+        for chunk in msg.chunks(self.byte_len) {
             let mut dchunk = self.oaep_decrypt(oaep, chunk)?;
             res.append(&mut dchunk);
         }
@@ -288,11 +346,11 @@ impl RSAPrivateKey {
         -> Result<Vec<u8>,RSAError>
     {
         // Step 1b
-        if c.len() != self.key_length {
+        if c.len() != self.byte_len {
             return Err(RSAError::DecryptionError);
         }
         // Step 1c
-        if self.key_length < ((2 * oaep.hash_len()) + 2) {
+        if self.byte_len < ((2 * oaep.hash_len()) + 2) {
             return Err(RSAError::DecryptHashMismatch);
         }
         // Step 2a
@@ -300,7 +358,7 @@ impl RSAPrivateKey {
         // Step 2b
         let m_ip = dp(&self.n, &self.d, &c_ip);
         // Step 2c
-        let em = i2osp(&m_ip, self.key_length);
+        let em = i2osp(&m_ip, self.byte_len);
         // Step 3a
         let l_hash = oaep.hash(oaep.label.as_bytes());
         // Step 3b
@@ -311,7 +369,7 @@ impl RSAPrivateKey {
         // Step 3d
         let seed = xor_vecs(&masked_seed.to_vec(), &seed_mask);
         // Step 3e
-        let db_mask = oaep.mgf1(&seed, self.key_length - oaep.hash_len() - 1);
+        let db_mask = oaep.mgf1(&seed, self.byte_len - oaep.hash_len() - 1);
         // Step 3f
         let db = xor_vecs(&masked_db.to_vec(), &db_mask);
         // Step 3g
@@ -424,10 +482,24 @@ impl<H: Clone + Input + FixedOutput> OAEPParams<H> {
     }
 }
 
+fn decode_biguint(b: &ASN1Block) -> Result<BigUint,RSAError> {
+    match b {
+        &ASN1Block::Integer(_, _, ref v) => {
+            match v.to_biguint() {
+                Some(sn) => Ok(sn),
+                _        => Err(RSAError::InvalidKey)
+            }
+        }
+        _ =>
+            Err(RSAError::ASN1DecodeErr(ASN1DecodeErr::EmptyBuffer))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use quickcheck::{Arbitrary,Gen};
     use sha2::Sha224;
+    use simple_asn1::{der_decode,der_encode};
     use super::*;
 
     const TEST_KEY_SIZES: [usize; 2] = [512, 1024];
@@ -461,6 +533,12 @@ mod tests {
             let sig = sp1(&kpv.kp.private.n, &kpv.kp.private.d, &m);
             let mprime = vp1(&kpv.kp.public.n, &kpv.kp.public.e, &sig);
             mprime == m
+        }
+
+        fn asn1_encoding_inverts(kpv: KeyPairAndNum) -> bool {
+            let bytes = der_encode(&kpv.kp.public).unwrap();
+            let kp2: RSAPublicKey = der_decode(&bytes).unwrap();
+            (kp2.n == kpv.kp.public.n) && (kp2.e == kpv.kp.public.e)
         }
     }
 
