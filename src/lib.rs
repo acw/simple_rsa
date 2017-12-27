@@ -50,7 +50,7 @@ pub use signing_hashes::{SigningHash,
 
 
 /// An RSA public and private key.
-#[derive(Clone,Debug)]
+#[derive(Clone,Debug,PartialEq)]
 pub struct RSAKeyPair {
     pub private: RSAPrivateKey,
     pub public:  RSAPublicKey
@@ -116,7 +116,7 @@ impl RSAKeyPair {
 
 
 /// A RSA public key.
-#[derive(Clone,Debug)]
+#[derive(Clone,Debug,PartialEq)]
 pub struct RSAPublicKey {
     byte_len: usize,
     n: BigUint,
@@ -299,7 +299,7 @@ fn xor_vecs(a: &Vec<u8>, b: &Vec<u8>) -> Vec<u8> {
 
 
 /// A RSA private key.
-#[derive(Clone,Debug)]
+#[derive(Clone,Debug,PartialEq)]
 pub struct RSAPrivateKey {
     byte_len: usize,
     n: BigUint,
